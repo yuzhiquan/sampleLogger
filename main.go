@@ -129,10 +129,9 @@ func (l *zapLogger) WithName(name string) logr.Logger {
 
 // NewLogger creates a new logr.Logger using the given Zap Logger to log.
 func NewJsonLogger(l *zap.Logger) logr.Logger {
-	cfg := zap.Config{
-		Encoding: "json",
-		Level:    zap.NewAtomicLevelAt(zapcore.DebugLevel),
-		EncoderConfig: zapcore.EncoderConfig{
+
+	encoderConfig :=
+		zapcore.EncoderConfig{
 			MessageKey: "msg",
 
 			LevelKey:    "v",
@@ -140,12 +139,11 @@ func NewJsonLogger(l *zap.Logger) logr.Logger {
 
 			TimeKey:    "ts",
 			EncodeTime: zapcore.EpochMillisTimeEncoder,
-		},
-	}
+		}
 	log := l.WithOptions(zap.AddCallerSkip(1),
 		zap.WrapCore(
 			func(zapcore.Core) zapcore.Core {
-				return zapcore.NewCore(zapcore.NewJSONEncoder(cfg.EncoderConfig), zapcore.AddSync(os.Stdout), zapcore.DebugLevel)
+				return zapcore.NewCore(zapcore.NewJSONEncoder(encoderConfig), zapcore.AddSync(os.Stdout), zapcore.DebugLevel)
 			}))
 	return &zapLogger{
 		l: log,
