@@ -22,12 +22,14 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"os"
+	"time"
 )
 
 const (
 	jsonLogFormat = "json"
 )
 
+var timeNow = time.Now
 type noopInfoLogger struct{}
 
 func (l *noopInfoLogger) Enabled() bool                   { return false }
@@ -40,9 +42,16 @@ type infoLogger struct {
 	l   *zap.Logger
 }
 
+// implement logr.InfoLogger
+var _ logr.InfoLogger = &infoLogger{}
+
+// Enabled always return true
 func (l *infoLogger) Enabled() bool { return true }
+
+// Info write message to error level log
 func (l *infoLogger) Info(msg string, keysAndVals ...interface{}) {
 	if checkedEntry := l.l.Check(l.lvl, msg); checkedEntry != nil {
+		checkedEntry.Time = timeNow()
 		checkedEntry.Write(handleFields(l.l, keysAndVals)...)
 	}
 }
@@ -61,17 +70,11 @@ func handleFields(l *zap.Logger, args []interface{}, additional ...zap.Field) []
 	// fields (since logr has no concept of that), so guess that we need a
 	// little less space.
 	fields := make([]zap.Field, 0, len(args)/2+len(additional))
-	for i := 0; i < len(args); {
+	for i := 0; i < len(args)-1; i += 2 {
 		// check just in case for strongly-typed Zap fields, which is illegal (since
 		// it breaks implementation agnosticism), so we can give a better error message.
 		if _, ok := args[i].(zap.Field); ok {
 			l.DPanic("strongly-typed Zap Field passed to logr", zap.Any("zap field", args[i]))
-			break
-		}
-
-		// make sure this isn't a mismatched key
-		if i == len(args)-1 {
-			l.DPanic("odd number of arguments passed as key-value pairs for logging", zap.Any("ignored key", args[i]))
 			break
 		}
 
@@ -86,7 +89,6 @@ func handleFields(l *zap.Logger, args []interface{}, additional ...zap.Field) []
 		}
 
 		fields = append(fields, zap.Any(keyStr, val))
-		i += 2
 	}
 
 	return append(fields, additional...)
@@ -100,51 +102,68 @@ type zapLogger struct {
 	infoLogger
 }
 
+// implement logr.Logger
+var _ logr.Logger = &zapLogger{}
+
+// Error write log message to error level
 func (l *zapLogger) Error(err error, msg string, keysAndVals ...interface{}) {
-	if checkedEntry := l.l.Check(zap.ErrorLevel, msg); checkedEntry != nil {
-		checkedEntry.Write(handleFields(l.l, keysAndVals, handleError(err))...)
+	entry := zapcore.Entry{
+		Level:   zapcore.ErrorLevel,
+		Time:    timeNow(),
+		Message: msg,
 	}
+	checkedEntry := l.l.Core().Check(entry, nil)
+	checkedEntry.Write(handleFields(l.l, keysAndVals, handleError(err))...)
 }
 
+// V return info logr.Logger with specified level
 func (l *zapLogger) V(level int) logr.InfoLogger {
 	lvl := zapcore.Level(-1 * level)
 	if l.l.Core().Enabled(lvl) {
 		return &infoLogger{
-			lvl: lvl,
 			l:   l.l,
+			lvl: lvl,
 		}
 	}
 	return disabledInfoLogger
 }
 
+// WithValues return logr.Logger with some keys And Values
 func (l *zapLogger) WithValues(keysAndValues ...interface{}) logr.Logger {
-	newLogger := l.l.With(handleFields(l.l, keysAndValues)...)
-	return NewJsonLogger(newLogger)
+	l.l = l.l.With(handleFields(l.l, keysAndValues)...)
+	return l
 }
 
+// WithName return logger Named with specified name
 func (l *zapLogger) WithName(name string) logr.Logger {
-	newLogger := l.l.Named(name)
-	return NewJsonLogger(newLogger)
+	l.l = l.l.Named(name)
+	return l
 }
 
-// NewLogger creates a new logr.Logger using the given Zap Logger to log.
-func NewJsonLogger(l *zap.Logger) logr.Logger {
+// encoderConfig config zap json encoder key format, and encodetime format
+var encoderConfig = zapcore.EncoderConfig{
+	MessageKey: "msg",
 
-	encoderConfig :=
-		zapcore.EncoderConfig{
-			MessageKey: "msg",
+	LevelKey:    "v",
+	EncodeLevel: int8LevelEncoder,
 
-			LevelKey:    "v",
-			EncodeLevel: CapitalLevelEncoder,
+	TimeKey:    "ts",
+	EncodeTime: zapcore.EpochMillisTimeEncoder,
+}
 
-			TimeKey:    "ts",
-			EncodeTime: zapcore.EpochMillisTimeEncoder,
-		}
+// NewJSONLogger creates a new json logr.Logger using the given Zap Logger to log.
+func NewJSONLogger(l *zap.Logger, w zapcore.WriteSyncer) logr.Logger {
+	var syncer zapcore.WriteSyncer
+	syncer = os.Stdout
+	if w != nil {
+		syncer = w
+	}
 	log := l.WithOptions(zap.AddCallerSkip(1),
 		zap.WrapCore(
 			func(zapcore.Core) zapcore.Core {
-				return zapcore.NewCore(zapcore.NewJSONEncoder(encoderConfig), zapcore.AddSync(os.Stdout), zapcore.DebugLevel)
+				return zapcore.NewCore(zapcore.NewJSONEncoder(encoderConfig), zapcore.AddSync(syncer), zapcore.DebugLevel)
 			}))
+
 	return &zapLogger{
 		l: log,
 		infoLogger: infoLogger{
@@ -154,7 +173,7 @@ func NewJsonLogger(l *zap.Logger) logr.Logger {
 	}
 }
 
-func CapitalLevelEncoder(l zapcore.Level, enc zapcore.PrimitiveArrayEncoder) {
+func int8LevelEncoder(l zapcore.Level, enc zapcore.PrimitiveArrayEncoder) {
 	lvl := int8(l)
 	if lvl < 0 {
 		lvl = -lvl
@@ -167,11 +186,12 @@ func handleError(err error) zap.Field {
 }
 
 func main() {
-	l := NewJsonLogger(zap.NewExample())
+	logger, _ := zap.NewProduction()
+	l := NewJSONLogger(logger, nil)
 	l = l.WithName("MyName").WithValues("user", "you")
 	err := fmt.Errorf("timeout")
 	l.Error(err, "Failed to update pod status")
-	l.V(1).Info("hahaha")
+	l.V(3).Info("test", "ns", "default", "podnum", 2)
 }
 
 // result in
